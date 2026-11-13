@@ -56,14 +56,14 @@ class SpectralSpatial3DCNN(nn.Module):
         # Classifier head: 1x1 2D Conv mapping 32 spatial features to raw class logits
         self.classifier = nn.Conv2d(32, num_classes, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the 3D-2D network.
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract 2D spatial feature maps after 3D convolutions and spectral pooling.
 
         Args:
             x: Input tensor of shape (batch_size, in_channels, spectral_depth, height, width).
 
         Returns:
-            Raw logits tensor of shape (batch_size, num_classes, height, width).
+            Spatial feature maps of shape (batch_size, 32, height, width).
         """
         if x.ndim != 5:
             raise ValueError(
@@ -78,6 +78,18 @@ class SpectralSpatial3DCNN(nn.Module):
 
         # Collapse spectral depth via adaptive pooling -> (B, 32, H, W)
         spatial_features = torch.mean(out, dim=2)
+        return spatial_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the 3D-2D network.
+
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, spectral_depth, height, width).
+
+        Returns:
+            Raw logits tensor of shape (batch_size, num_classes, height, width).
+        """
+        spatial_features = self.extract_features(x)
 
         # Pixel-level classification head -> (B, num_classes, H, W)
         logits = self.classifier(spatial_features)
