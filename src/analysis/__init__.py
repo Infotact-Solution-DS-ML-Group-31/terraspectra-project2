@@ -5,9 +5,15 @@ from src.analysis.spectral_index import (
     compute_red_edge_stress,
     summarize_field_health,
 )
+from src.analysis.geospatial import (
+    raster_to_geogrid,
+    simulate_temporal_spread,
+)
 
 __all__ = [
     "compute_ndvi",
     "compute_red_edge_stress",
     "summarize_field_health",
+    "raster_to_geogrid",
+    "simulate_temporal_spread",
 ]
