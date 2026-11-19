@@ -1,0 +1,353 @@
+"""TerraSpectra: 3D Geospatial Crop Disease Forecasting Dashboard.
+
+Built with 100% Pure Python using Streamlit and PyDeck for GPU-accelerated
+3D geospatial rendering, biophysical spectral index analysis, and temporal
+epidemic spread modeling.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+import numpy as np
+import pandas as pd
+import pydeck as pdk
+import streamlit as st
+import torch.nn as nn
+
+from src.analysis.geospatial import raster_to_geogrid, simulate_temporal_spread
+from src.analysis.spectral_index import (
+    compute_ndvi,
+    compute_red_edge_stress,
+    summarize_field_health,
+)
+from src.api.tiling import TilingConfig, predict_full_raster
+from src.data.cube_loader import generate_synthetic_hyperspectral_cube
+from src.data.pca_reducer import SpectralPCAReducer
+from src.models.cnn3d import SpectralSpatial3DCNN
+from src.models.hybrid import HybridSpectralSpatialViT
+
+# Global model cache to avoid re-instantiation overhead
+_MODEL_CACHE: Dict[str, nn.Module] = {}
+
+
+def get_cached_model(model_type: str) -> nn.Module:
+    """Retrieve or instantiate requested neural model in evaluation mode."""
+    if model_type not in _MODEL_CACHE:
+        if model_type == "hybrid":
+            model = HybridSpectralSpatialViT(
+                in_channels=1,
+                cnn_features=32,
+                vit_embed_dim=64,
+                patch_size=4,
+                num_classes=2,
+            )
+        elif model_type == "cnn3d":
+            model = SpectralSpatial3DCNN(
+                in_channels=1,
+                num_classes=2,
+            )
+        else:
+            raise ValueError(f"Unknown model_type: '{model_type}'")
+        model.eval()
+        _MODEL_CACHE[model_type] = model
+    return _MODEL_CACHE[model_type]
+
+
+def run_dashboard_pipeline(
+    model_type: str = "hybrid",
+    size: int = 32,
+    threshold: float = 0.5,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """Execute end-to-end hyperspectral data generation, inference, and analysis.
+
+    Pure-Python pipeline callable both inside the Streamlit app and directly in
+    automated unit tests.
+
+    Args:
+        model_type: Model architecture ('hybrid' or 'cnn3d').
+        size: Spatial raster extent (height and width in pixels).
+        threshold: Blight classification probability threshold in [0.0, 1.0].
+        seed: Random seed for synthetic cube generation.
+
+    Returns:
+        Dictionary containing:
+            - 'prob_map': 2D float32 array of base disease probabilities
+            - 'ndvi_map': 2D float32 array of NDVI values
+            - 'stress_map': 2D float32 array of Red-Edge Stress values
+            - 'temporal_frames': Dict mapping day (int) to 2D probability array
+            - 'health_summary': Diagnostic dictionary from summarize_field_health
+            - 'geogrid_records': List of georeferenced pixel records for PyDeck
+    """
+    # 1. Simulate 224-band continuous hyperspectral datacube (400-2500nm)
+    cube, _ = generate_synthetic_hyperspectral_cube(
+        height=size,
+        width=size,
+        num_bands=224,
+        disease_zone_radius=max(4, size // 8),
+        seed=seed,
+    )
+
+    # 2. Biophysical spectral indices
+    ndvi_map = compute_ndvi(cube)
+    stress_map = compute_red_edge_stress(cube)
+
+    # 3. Spectral PCA dimensionality reduction (224 bands -> 15 components)
+    reducer = SpectralPCAReducer(n_components=15, random_state=seed)
+    reduced_raster = reducer.fit_transform(cube)
+
+    # 4. Neural inference via overlapping spatial tiling
+    model = get_cached_model(model_type)
+    tiling_cfg = TilingConfig(patch_size=16, stride=8, batch_size=8, device="cpu")
+    prob_map = predict_full_raster(model, reduced_raster, config=tiling_cfg)
+
+    # 5. Temporal epidemic spread simulation across forecast horizons
+    temporal_frames = simulate_temporal_spread(
+        base_prob_map=prob_map,
+        days=[0, 3, 7, 14],
+        growth_rate=0.06,
+    )
+
+    # 6. Field health summarization for base detection
+    health_summary = summarize_field_health(
+        prob_map=prob_map,
+        ndvi_map=ndvi_map,
+        threshold=threshold,
+        pixel_area_sq_m=1.0,
+    )
+
+    # 7. Convert to georeferenced 3D grid records
+    geogrid_records = raster_to_geogrid(
+        prob_map=prob_map,
+        ndvi_map=ndvi_map,
+        stress_map=stress_map,
+        threshold=threshold,
+    )
+
+    return {
+        "prob_map": prob_map,
+        "ndvi_map": ndvi_map,
+        "stress_map": stress_map,
+        "temporal_frames": temporal_frames,
+        "health_summary": health_summary,
+        "geogrid_records": geogrid_records,
+    }
+
+
+def main() -> None:
+    """Render the interactive Streamlit + PyDeck geospatial dashboard."""
+    st.set_page_config(
+        page_title="TerraSpectra 3D GIS",
+        page_icon="🛰️",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    st.title("🛰️ TerraSpectra: 3D Geospatial Crop Disease Forecasting")
+    st.caption(
+        "100% Pure-Python Geospatial AI • NASA Hyperion / ESA Sentinel Simulation • "
+        "3D Spectral-Spatial ViT + PyDeck WebGL"
+    )
+
+    # ==========================
+    # Sidebar Controls
+    # ==========================
+    with st.sidebar:
+        st.header("⚙️ Simulation & Model Controls")
+
+        model_type = st.selectbox(
+            "Neural Architecture",
+            options=["hybrid", "cnn3d"],
+            index=0,
+            help="Hybrid Spectral-Spatial ViT combines 3D-CNN with multi-head attention.",
+        )
+
+        size = st.select_slider(
+            "Spatial Resolution (px)",
+            options=[32, 64],
+            value=32,
+            help="Field dimension in pixels (e.g., 32x32 = 1,024 spatial survey points).",
+        )
+
+        threshold = st.slider(
+            "Disease Probability Threshold",
+            min_value=0.2,
+            max_value=0.8,
+            value=0.5,
+            step=0.05,
+            help="Decision cutoff for classifying a canopy pixel as infected.",
+        )
+
+        selected_day = st.select_slider(
+            "Forecast Timeline (Days)",
+            options=[0, 3, 7, 14],
+            value=0,
+            help="Scrub through temporal disease spread progression.",
+        )
+
+        seed = st.number_input(
+            "Random Simulation Seed",
+            min_value=1,
+            max_value=9999,
+            value=42,
+            step=1,
+            help="Reproducibility seed for synthetic hyperspectral imaging spectrometer acquisition.",
+        )
+
+    # ==========================
+    # Execute Pipeline
+    # ==========================
+    with st.spinner("Processing Hyperspectral Datacube & Running 3D-ViT Inference..."):
+        results = run_dashboard_pipeline(
+            model_type=model_type,
+            size=size,
+            threshold=threshold,
+            seed=seed,
+        )
+
+    # Extract target day's spatial frame
+    current_prob_map = results["temporal_frames"][selected_day]
+    ndvi_map = results["ndvi_map"]
+    stress_map = results["stress_map"]
+
+    # Recompute metrics and geogrid for selected timeline day
+    health_summary = summarize_field_health(
+        prob_map=current_prob_map,
+        ndvi_map=ndvi_map,
+        threshold=threshold,
+        pixel_area_sq_m=1.0,
+    )
+    geogrid_records = raster_to_geogrid(
+        prob_map=current_prob_map,
+        ndvi_map=ndvi_map,
+        stress_map=stress_map,
+        threshold=threshold,
+    )
+    df_grid = pd.DataFrame(geogrid_records)
+
+    # ==========================
+    # 4 KPI Metric Cards
+    # ==========================
+    col1, col2, col3, col4 = st.columns(4)
+
+    severity_color = {
+        "Low": "🟢",
+        "Moderate": "🟡",
+        "High": "🔴",
+    }.get(health_summary["severity_level"], "⚪")
+
+    col1.metric(
+        label="Severity Level",
+        value=f"{severity_color} {health_summary['severity_level']}",
+        delta=f"Day {selected_day} Forecast",
+    )
+    col2.metric(
+        label="Infected Area (%)",
+        value=f"{health_summary['infected_percentage']:.1f}%",
+        delta=f"{health_summary['infected_pixels']} / {health_summary['total_pixels']} px",
+        delta_color="inverse",
+    )
+    col3.metric(
+        label="Infected Hectares",
+        value=f"{health_summary['infected_area_hectares']:.3f} ha",
+        help="Physical ground area affected (1 ha = 10,000 m²).",
+    )
+    col4.metric(
+        label="Mean Disease Risk",
+        value=f"{health_summary['mean_disease_probability']:.2%}",
+        help="Canopy-wide average fungal blight risk score.",
+    )
+
+    st.markdown("---")
+
+    # ==========================
+    # Interactive PyDeck 3D Map
+    # ==========================
+    st.subheader(f"🗺️ 3D Geospatial Field Risk Map (Day {selected_day})")
+    st.caption(
+        "Interactive 3D WebGL column rendering. Elevation indicates disease probability "
+        "(0-80m scaled height). Colors: Green = Healthy, Amber = Watch, Glowing Red = Blight Outbreak."
+    )
+
+    column_layer = pdk.Layer(
+        "ColumnLayer",
+        data=df_grid,
+        get_position=["lon", "lat"],
+        get_elevation="elevation",
+        elevation_scale=1.0,
+        radius=8,
+        get_fill_color="color_rgba",
+        pickable=True,
+        auto_highlight=True,
+        extruded=True,
+    )
+
+    origin_lat = df_grid["lat"].mean()
+    origin_lon = df_grid["lon"].mean()
+
+    view_state = pdk.ViewState(
+        latitude=origin_lat,
+        longitude=origin_lon,
+        zoom=16.5,
+        pitch=48,
+        bearing=18,
+    )
+
+    tooltip = {
+        "html": """
+        <div style="background-color: #1a1c23; padding: 10px; border-radius: 6px; font-family: monospace; border: 1px solid #333;">
+            <b style="color: #61afef;">TerraSpectra Survey Point</b><br/>
+            <b>Status:</b> {risk_label}<br/>
+            <b>Blight Risk:</b> {probability}<br/>
+            <b>NDVI:</b> {ndvi}<br/>
+            <b>Red-Edge Stress:</b> {stress}<br/>
+            <b>Coord:</b> ({lat}, {lon})
+        </div>
+        """,
+        "style": {"color": "white"},
+    }
+
+    deck = pdk.Deck(
+        layers=[column_layer],
+        initial_view_state=view_state,
+        tooltip=tooltip,
+        map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+    )
+
+    st.pydeck_chart(deck, use_container_width=True)
+
+    # ==========================
+    # Biophysical Indices & Export
+    # ==========================
+    st.markdown("---")
+    info_col1, info_col2 = st.columns([2, 1])
+
+    with info_col1:
+        st.subheader("🌿 Biophysical Canopy Health Analysis")
+        comp_col1, comp_col2, comp_col3 = st.columns(3)
+        comp_col1.metric("Healthy Canopy NDVI", f"{health_summary['mean_ndvi_healthy']:.3f}")
+        comp_col2.metric("Infected Canopy NDVI", f"{health_summary['mean_ndvi_infected']:.3f}")
+        ndvi_delta = health_summary["mean_ndvi_healthy"] - health_summary["mean_ndvi_infected"]
+        comp_col3.metric("Foliar Contrast Delta", f"{ndvi_delta:.3f}")
+
+        st.info(
+            "💡 **Pre-symptomatic Detection**: Note that visible NDVI remains relatively resilient "
+            "in early phases, while the 3D-ViT leverages continuous red-edge transition bands (700-750nm) "
+            "to detect cellular collapse before physical wilting or chlorosis emerges."
+        )
+
+    with info_col2:
+        st.subheader("📥 Export Georeferenced Risk Data")
+        st.write("Export detailed 3D column records for GIS integration (QGIS, ArcGIS, GeoJSON).")
+        csv_bytes = df_grid.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download Survey Grid (CSV)",
+            data=csv_bytes,
+            file_name=f"terraspectra_grid_day_{selected_day}_{model_type}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
+if __name__ == "__main__":
+    main()
