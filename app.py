@@ -7,6 +7,9 @@ epidemic spread modeling.
 
 from __future__ import annotations
 
+import json
+import urllib.error
+import urllib.request
 from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
@@ -134,6 +137,55 @@ def run_dashboard_pipeline(
     }
 
 
+def _call_fastapi_backend(
+    api_url: str,
+    model_type: str,
+    size: int,
+    threshold: float,
+    seed: int,
+) -> Optional[Dict[str, Any]]:
+    """Attempt to call the FastAPI forecast endpoint and return parsed JSON.
+
+    Uses only the Python standard library (``urllib.request`` + ``json``) so
+    no extra dependencies are needed.
+
+    Args:
+        api_url: Full URL to the FastAPI ``/api/v1/forecast`` endpoint.
+        model_type: ``"hybrid"`` or ``"cnn3d"``.
+        size: Raster height/width in pixels.
+        threshold: Blight probability classification threshold.
+        seed: Random seed for reproducible synthetic generation.
+
+    Returns:
+        Parsed response dict on success, or ``None`` if the server is
+        unavailable / returns a non-200 status.
+    """
+    payload = {
+        "height": size,
+        "width": size,
+        "bands": 224,
+        "pca_components": 15,
+        "model_type": model_type,
+        "disease_threshold": threshold,
+        "pixel_area_sq_m": 1.0,
+        "seed": seed,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        api_url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError):
+        pass
+    return None
+
+
 def main() -> None:
     """Render the interactive Streamlit + PyDeck geospatial dashboard."""
     st.set_page_config(
@@ -194,16 +246,95 @@ def main() -> None:
             help="Reproducibility seed for synthetic hyperspectral imaging spectrometer acquisition.",
         )
 
+        st.markdown("---")
+        st.subheader("🔌 Backend Configuration")
+
+        use_fastapi = st.toggle(
+            "Use FastAPI Backend",
+            value=False,
+            help=(
+                "When enabled, the dashboard calls the TerraSpectra FastAPI microservice "
+                "instead of running the pipeline locally.  Falls back to the local "
+                "Python pipeline if the server is unreachable."
+            ),
+        )
+
+        api_url = st.text_input(
+            "FastAPI Forecast URL",
+            value="http://127.0.0.1:8000/api/v1/forecast",
+            disabled=not use_fastapi,
+            help="URL of the POST /api/v1/forecast endpoint (requires the FastAPI server to be running).",
+        )
+
     # ==========================
     # Execute Pipeline
     # ==========================
     with st.spinner("Processing Hyperspectral Datacube & Running 3D-ViT Inference..."):
-        results = run_dashboard_pipeline(
-            model_type=model_type,
-            size=size,
-            threshold=threshold,
-            seed=seed,
-        )
+        api_response: Optional[Dict[str, Any]] = None
+
+        if use_fastapi:
+            api_response = _call_fastapi_backend(
+                api_url=api_url,
+                model_type=model_type,
+                size=size,
+                threshold=threshold,
+                seed=int(seed),
+            )
+            if api_response is None:
+                st.warning(
+                    "⚠️ **FastAPI backend unreachable** — falling back to the local "
+                    "Python pipeline.  Start the server with:\n\n"
+                    "```\n.venv\\Scripts\\uvicorn.exe src.api.main:app --reload --port 8000\n```"
+                )
+
+        # Use local pipeline if FastAPI is disabled or server was unreachable
+        if api_response is None:
+            results = run_dashboard_pipeline(
+                model_type=model_type,
+                size=size,
+                threshold=threshold,
+                seed=int(seed),
+            )
+        else:
+            # Build a results dict compatible with the rest of the dashboard from
+            # the FastAPI JSON response.  The API returns flat prob / ndvi maps;
+            # we reconstruct numpy arrays and derive temporal frames locally.
+            import numpy as _np  # local to avoid shadowing module-level np
+
+            prob_flat = api_response.get("probability_map", [])
+            ndvi_flat = api_response.get("ndvi_map", [])
+            stress_flat = api_response.get("red_edge_stress_map", [])
+
+            prob_map_api = _np.array(prob_flat, dtype=_np.float32)
+            ndvi_map_api = _np.array(ndvi_flat, dtype=_np.float32)
+            stress_map_api = _np.array(stress_flat, dtype=_np.float32)
+
+            temporal_frames = simulate_temporal_spread(
+                base_prob_map=prob_map_api,
+                days=[0, 3, 7, 14],
+                growth_rate=0.06,
+            )
+            health_summary_api = summarize_field_health(
+                prob_map=prob_map_api,
+                ndvi_map=ndvi_map_api,
+                threshold=threshold,
+                pixel_area_sq_m=1.0,
+            )
+            geogrid_records_api = raster_to_geogrid(
+                prob_map=prob_map_api,
+                ndvi_map=ndvi_map_api,
+                stress_map=stress_map_api,
+                threshold=threshold,
+            )
+            results = {
+                "prob_map": prob_map_api,
+                "ndvi_map": ndvi_map_api,
+                "stress_map": stress_map_api,
+                "temporal_frames": temporal_frames,
+                "health_summary": health_summary_api,
+                "geogrid_records": geogrid_records_api,
+            }
+            st.success("✅ Results fetched from FastAPI backend.")
 
     # Extract target day's spatial frame
     current_prob_map = results["temporal_frames"][selected_day]
