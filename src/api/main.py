@@ -6,7 +6,9 @@ hyperspectral crop disease forecasting.
 
 from __future__ import annotations
 
-from typing import Dict
+import os
+from pathlib import Path
+from typing import Any, Dict, List
 from fastapi import FastAPI, HTTPException
 import torch.nn as nn
 
@@ -65,6 +67,31 @@ def health_check() -> HealthResponse:
         model_loaded=True,
         available_models=list(_MODEL_REGISTRY.keys()),
     )
+
+
+_DEFAULT_PCA_COMPONENTS = 15
+_CHECKPOINT_DIR = Path("checkpoints")
+
+
+@app.get("/api/v1/models")
+def list_models() -> Dict[str, Any]:
+    """Return available model architectures and configuration metadata.
+
+    Returns:
+        JSON object with:
+        - ``architectures``: List of supported model type identifiers.
+        - ``default_pca_components``: Default spectral PCA components used
+          for inference (must match training configuration).
+        - ``checkpoint_dir_exists``: Whether the local ``checkpoints/``
+          directory exists on this server instance.
+        - ``checkpoint_dir``: Relative path to the checkpoint directory.
+    """
+    return {
+        "architectures": list(_MODEL_REGISTRY.keys()),
+        "default_pca_components": _DEFAULT_PCA_COMPONENTS,
+        "checkpoint_dir_exists": _CHECKPOINT_DIR.is_dir(),
+        "checkpoint_dir": str(_CHECKPOINT_DIR),
+    }
 
 
 @app.post("/api/v1/forecast", response_model=ForecastResponse)

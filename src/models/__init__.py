@@ -5,6 +5,7 @@ from src.models.vit import SpatialVisionTransformer
 from src.models.hybrid import HybridSpectralSpatialViT
 from src.models.metrics import evaluate_segmentation, iou_score, dice_score
 from src.models.train import TrainConfig, run_training
+from src.models.checkpoint import save_model_checkpoint, load_model_checkpoint
 
 __all__ = [
     "SpectralSpatial3DCNN",
@@ -15,6 +16,8 @@ __all__ = [
     "dice_score",
     "TrainConfig",
     "run_training",
+    "save_model_checkpoint",
+    "load_model_checkpoint",
 ]
 
 
