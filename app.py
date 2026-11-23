@@ -26,6 +26,7 @@ from src.analysis.spectral_index import (
 from src.api.tiling import TilingConfig, predict_full_raster
 from src.data.cube_loader import generate_synthetic_hyperspectral_cube
 from src.data.pca_reducer import SpectralPCAReducer
+from src.models.benchmark import compare_architectures
 from src.models.cnn3d import SpectralSpatial3DCNN
 from src.models.hybrid import HybridSpectralSpatialViT
 
@@ -336,148 +337,196 @@ def main() -> None:
             }
             st.success("✅ Results fetched from FastAPI backend.")
 
-    # Extract target day's spatial frame
-    current_prob_map = results["temporal_frames"][selected_day]
-    ndvi_map = results["ndvi_map"]
-    stress_map = results["stress_map"]
-
-    # Recompute metrics and geogrid for selected timeline day
-    health_summary = summarize_field_health(
-        prob_map=current_prob_map,
-        ndvi_map=ndvi_map,
-        threshold=threshold,
-        pixel_area_sq_m=1.0,
-    )
-    geogrid_records = raster_to_geogrid(
-        prob_map=current_prob_map,
-        ndvi_map=ndvi_map,
-        stress_map=stress_map,
-        threshold=threshold,
-    )
-    df_grid = pd.DataFrame(geogrid_records)
-
     # ==========================
-    # 4 KPI Metric Cards
+    # Main View Tabs
     # ==========================
-    col1, col2, col3, col4 = st.columns(4)
+    tab_map, tab_benchmark = st.tabs(["🗺️ 3D Disease Map", "⚡ Model Benchmark"])
 
-    severity_color = {
-        "Low": "🟢",
-        "Moderate": "🟡",
-        "High": "🔴",
-    }.get(health_summary["severity_level"], "⚪")
+    with tab_map:
+        # Extract target day's spatial frame
+        current_prob_map = results["temporal_frames"][selected_day]
+        ndvi_map = results["ndvi_map"]
+        stress_map = results["stress_map"]
 
-    col1.metric(
-        label="Severity Level",
-        value=f"{severity_color} {health_summary['severity_level']}",
-        delta=f"Day {selected_day} Forecast",
-    )
-    col2.metric(
-        label="Infected Area (%)",
-        value=f"{health_summary['infected_percentage']:.1f}%",
-        delta=f"{health_summary['infected_pixels']} / {health_summary['total_pixels']} px",
-        delta_color="inverse",
-    )
-    col3.metric(
-        label="Infected Hectares",
-        value=f"{health_summary['infected_area_hectares']:.3f} ha",
-        help="Physical ground area affected (1 ha = 10,000 m²).",
-    )
-    col4.metric(
-        label="Mean Disease Risk",
-        value=f"{health_summary['mean_disease_probability']:.2%}",
-        help="Canopy-wide average fungal blight risk score.",
-    )
+        # Recompute metrics and geogrid for selected timeline day
+        health_summary = summarize_field_health(
+            prob_map=current_prob_map,
+            ndvi_map=ndvi_map,
+            threshold=threshold,
+            pixel_area_sq_m=1.0,
+        )
+        geogrid_records = raster_to_geogrid(
+            prob_map=current_prob_map,
+            ndvi_map=ndvi_map,
+            stress_map=stress_map,
+            threshold=threshold,
+        )
+        df_grid = pd.DataFrame(geogrid_records)
 
-    st.markdown("---")
+        # ==========================
+        # 4 KPI Metric Cards
+        # ==========================
+        col1, col2, col3, col4 = st.columns(4)
 
-    # ==========================
-    # Interactive PyDeck 3D Map
-    # ==========================
-    st.subheader(f"🗺️ 3D Geospatial Field Risk Map (Day {selected_day})")
-    st.caption(
-        "Interactive 3D WebGL column rendering. Elevation indicates disease probability "
-        "(0-80m scaled height). Colors: Green = Healthy, Amber = Watch, Glowing Red = Blight Outbreak."
-    )
+        severity_color = {
+            "Low": "🟢",
+            "Moderate": "🟡",
+            "High": "🔴",
+        }.get(health_summary["severity_level"], "⚪")
 
-    column_layer = pdk.Layer(
-        "ColumnLayer",
-        data=df_grid,
-        get_position=["lon", "lat"],
-        get_elevation="elevation",
-        elevation_scale=1.0,
-        radius=8,
-        get_fill_color="color_rgba",
-        pickable=True,
-        auto_highlight=True,
-        extruded=True,
-    )
-
-    origin_lat = df_grid["lat"].mean()
-    origin_lon = df_grid["lon"].mean()
-
-    view_state = pdk.ViewState(
-        latitude=origin_lat,
-        longitude=origin_lon,
-        zoom=16.5,
-        pitch=48,
-        bearing=18,
-    )
-
-    tooltip = {
-        "html": """
-        <div style="background-color: #1a1c23; padding: 10px; border-radius: 6px; font-family: monospace; border: 1px solid #333;">
-            <b style="color: #61afef;">TerraSpectra Survey Point</b><br/>
-            <b>Status:</b> {risk_label}<br/>
-            <b>Blight Risk:</b> {probability}<br/>
-            <b>NDVI:</b> {ndvi}<br/>
-            <b>Red-Edge Stress:</b> {stress}<br/>
-            <b>Coord:</b> ({lat}, {lon})
-        </div>
-        """,
-        "style": {"color": "white"},
-    }
-
-    deck = pdk.Deck(
-        layers=[column_layer],
-        initial_view_state=view_state,
-        tooltip=tooltip,
-        map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-    )
-
-    st.pydeck_chart(deck, use_container_width=True)
-
-    # ==========================
-    # Biophysical Indices & Export
-    # ==========================
-    st.markdown("---")
-    info_col1, info_col2 = st.columns([2, 1])
-
-    with info_col1:
-        st.subheader("🌿 Biophysical Canopy Health Analysis")
-        comp_col1, comp_col2, comp_col3 = st.columns(3)
-        comp_col1.metric("Healthy Canopy NDVI", f"{health_summary['mean_ndvi_healthy']:.3f}")
-        comp_col2.metric("Infected Canopy NDVI", f"{health_summary['mean_ndvi_infected']:.3f}")
-        ndvi_delta = health_summary["mean_ndvi_healthy"] - health_summary["mean_ndvi_infected"]
-        comp_col3.metric("Foliar Contrast Delta", f"{ndvi_delta:.3f}")
-
-        st.info(
-            "💡 **Pre-symptomatic Detection**: Note that visible NDVI remains relatively resilient "
-            "in early phases, while the 3D-ViT leverages continuous red-edge transition bands (700-750nm) "
-            "to detect cellular collapse before physical wilting or chlorosis emerges."
+        col1.metric(
+            label="Severity Level",
+            value=f"{severity_color} {health_summary['severity_level']}",
+            delta=f"Day {selected_day} Forecast",
+        )
+        col2.metric(
+            label="Infected Area (%)",
+            value=f"{health_summary['infected_percentage']:.1f}%",
+            delta=f"{health_summary['infected_pixels']} / {health_summary['total_pixels']} px",
+            delta_color="inverse",
+        )
+        col3.metric(
+            label="Infected Hectares",
+            value=f"{health_summary['infected_area_hectares']:.3f} ha",
+            help="Physical ground area affected (1 ha = 10,000 m²).",
+        )
+        col4.metric(
+            label="Mean Disease Risk",
+            value=f"{health_summary['mean_disease_probability']:.2%}",
+            help="Canopy-wide average fungal blight risk score.",
         )
 
-    with info_col2:
-        st.subheader("📥 Export Georeferenced Risk Data")
-        st.write("Export detailed 3D column records for GIS integration (QGIS, ArcGIS, GeoJSON).")
-        csv_bytes = df_grid.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="Download Survey Grid (CSV)",
-            data=csv_bytes,
-            file_name=f"terraspectra_grid_day_{selected_day}_{model_type}.csv",
-            mime="text/csv",
-            use_container_width=True,
+        st.markdown("---")
+
+        # ==========================
+        # Interactive PyDeck 3D Map
+        # ==========================
+        st.subheader(f"🗺️ 3D Geospatial Field Risk Map (Day {selected_day})")
+        st.caption(
+            "Interactive 3D WebGL column rendering. Elevation indicates disease probability "
+            "(0-80m scaled height). Colors: Green = Healthy, Amber = Watch, Glowing Red = Blight Outbreak."
         )
+
+        column_layer = pdk.Layer(
+            "ColumnLayer",
+            data=df_grid,
+            get_position=["lon", "lat"],
+            get_elevation="elevation",
+            elevation_scale=1.0,
+            radius=8,
+            get_fill_color="color_rgba",
+            pickable=True,
+            auto_highlight=True,
+            extruded=True,
+        )
+
+        origin_lat = df_grid["lat"].mean()
+        origin_lon = df_grid["lon"].mean()
+
+        view_state = pdk.ViewState(
+            latitude=origin_lat,
+            longitude=origin_lon,
+            zoom=16.5,
+            pitch=48,
+            bearing=18,
+        )
+
+        tooltip = {
+            "html": """
+            <div style="background-color: #1a1c23; padding: 10px; border-radius: 6px; font-family: monospace; border: 1px solid #333;">
+                <b style="color: #61afef;">TerraSpectra Survey Point</b><br/>
+                <b>Status:</b> {risk_label}<br/>
+                <b>Blight Risk:</b> {probability}<br/>
+                <b>NDVI:</b> {ndvi}<br/>
+                <b>Red-Edge Stress:</b> {stress}<br/>
+                <b>Coord:</b> ({lat}, {lon})
+            </div>
+            """,
+            "style": {"color": "white"},
+        }
+
+        deck = pdk.Deck(
+            layers=[column_layer],
+            initial_view_state=view_state,
+            tooltip=tooltip,
+            map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+        )
+
+        st.pydeck_chart(deck, use_container_width=True)
+
+        # ==========================
+        # Biophysical Indices & Export
+        # ==========================
+        st.markdown("---")
+        info_col1, info_col2 = st.columns([2, 1])
+
+        with info_col1:
+            st.subheader("🌿 Biophysical Canopy Health Analysis")
+            comp_col1, comp_col2, comp_col3 = st.columns(3)
+            comp_col1.metric("Healthy Canopy NDVI", f"{health_summary['mean_ndvi_healthy']:.3f}")
+            comp_col2.metric("Infected Canopy NDVI", f"{health_summary['mean_ndvi_infected']:.3f}")
+            ndvi_delta = health_summary["mean_ndvi_healthy"] - health_summary["mean_ndvi_infected"]
+            comp_col3.metric("Foliar Contrast Delta", f"{ndvi_delta:.3f}")
+
+            st.info(
+                "💡 **Pre-symptomatic Detection**: Note that visible NDVI remains relatively resilient "
+                "in early phases, while the 3D-ViT leverages continuous red-edge transition bands (700-750nm) "
+                "to detect cellular collapse before physical wilting or chlorosis emerges."
+            )
+
+        with info_col2:
+            st.subheader("📥 Export Georeferenced Risk Data")
+            st.write("Export detailed 3D column records for GIS integration (QGIS, ArcGIS, GeoJSON).")
+            csv_bytes = df_grid.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="Download Survey Grid (CSV)",
+                data=csv_bytes,
+                file_name=f"terraspectra_grid_day_{selected_day}_{model_type}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    with tab_benchmark:
+        st.subheader("⚡ Model Performance & Latency Benchmark")
+        st.caption(
+            "Side-by-side performance profiling: SpectralSpatial3DCNN vs. "
+            "HybridSpectralSpatialViT on inference latency, parameter counts, and segmentation accuracy."
+        )
+
+        if st.button("Run 3D-CNN vs Hybrid ViT Benchmark", key="run_benchmark_btn"):
+            with st.spinner("Benchmarking architectures (warmup + timed runs)..."):
+                bench_results = compare_architectures(
+                    height=32,
+                    width=32,
+                    pca_components=15,
+                    seed=int(seed),
+                )
+
+                bench_rows = []
+                for r in bench_results:
+                    m = r.get("metrics") or {}
+                    bench_rows.append({
+                        "Architecture": r["model_name"],
+                        "Trainable Params": f"{r['trainable_params']:,}",
+                        "Mean Latency (ms)": f"{r['mean_latency_ms']:.2f}",
+                        "Min Latency (ms)": f"{r['min_latency_ms']:.2f}",
+                        "Max Latency (ms)": f"{r['max_latency_ms']:.2f}",
+                        "IoU": f"{m.get('iou', 0.0):.4f}",
+                        "Dice": f"{m.get('dice', 0.0):.4f}",
+                        "Precision": f"{m.get('precision', 0.0):.4f}",
+                        "Recall": f"{m.get('recall', 0.0):.4f}",
+                        "Pixel Accuracy": f"{m.get('pixel_accuracy', 0.0):.4f}",
+                    })
+
+                st.markdown("### 📋 Architecture Comparison Table")
+                st.dataframe(pd.DataFrame(bench_rows), use_container_width=True)
+
+                st.markdown("### 📊 Mean Inference Latency (ms)")
+                df_latency = pd.DataFrame(
+                    {"Mean Latency (ms)": [r["mean_latency_ms"] for r in bench_results]},
+                    index=[r["model_name"] for r in bench_results],
+                )
+                st.bar_chart(df_latency)
 
 
 if __name__ == "__main__":

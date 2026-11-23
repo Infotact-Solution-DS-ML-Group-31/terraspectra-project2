@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, Dict, List
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 import torch.nn as nn
 
 from src.analysis.spectral_index import (
@@ -17,10 +17,16 @@ from src.analysis.spectral_index import (
     compute_red_edge_stress,
     summarize_field_health,
 )
-from src.api.schemas import ForecastRequest, ForecastResponse, HealthResponse
+from src.api.schemas import (
+    BenchmarkResponse,
+    ForecastRequest,
+    ForecastResponse,
+    HealthResponse,
+)
 from src.api.tiling import TilingConfig, predict_full_raster
 from src.data.cube_loader import generate_synthetic_hyperspectral_cube
 from src.data.pca_reducer import SpectralPCAReducer
+from src.models.benchmark import compare_architectures
 from src.models.cnn3d import SpectralSpatial3DCNN
 from src.models.hybrid import HybridSpectralSpatialViT
 
@@ -142,3 +148,31 @@ def generate_forecast(request: ForecastRequest) -> ForecastResponse:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+
+
+@app.get("/api/v1/benchmark", response_model=BenchmarkResponse)
+def get_benchmark(
+    height: int = Query(default=32, ge=16, le=128, description="Spatial height in pixels."),
+    width: int = Query(default=32, ge=16, le=128, description="Spatial width in pixels."),
+    pca_components: int = Query(default=15, ge=3, le=64, description="Target PCA spectral components."),
+    seed: int = Query(default=42, description="Random seed for sensor simulation."),
+) -> BenchmarkResponse:
+    """Run side-by-side architecture benchmark profiling 3D-CNN vs Hybrid ViT."""
+    try:
+        results = compare_architectures(
+            height=height,
+            width=width,
+            pca_components=pca_components,
+            seed=seed,
+        )
+        return BenchmarkResponse(
+            height=height,
+            width=width,
+            pca_components=pca_components,
+            results=results,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Benchmark error: {str(e)}")
+

@@ -14,6 +14,26 @@ class HealthResponse(BaseModel):
     available_models: List[str]
 
 
+class ArchitectureBenchmarkItem(BaseModel):
+    """Benchmark result for a single model architecture."""
+
+    model_name: str
+    trainable_params: int
+    mean_latency_ms: float
+    min_latency_ms: float
+    max_latency_ms: float
+    metrics: Optional[Dict[str, float]] = None
+
+
+class BenchmarkResponse(BaseModel):
+    """Side-by-side architecture benchmark response schema."""
+
+    height: int
+    width: int
+    pca_components: int
+    results: List[ArchitectureBenchmarkItem]
+
+
 class ForecastRequest(BaseModel):
     """Hyperspectral crop disease forecast request schema."""
 
