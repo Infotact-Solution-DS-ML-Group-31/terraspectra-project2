@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple, Union
 from fastapi import FastAPI, HTTPException, Query
 import torch.nn as nn
 
@@ -27,6 +27,7 @@ from src.api.tiling import TilingConfig, predict_full_raster
 from src.data.cube_loader import generate_synthetic_hyperspectral_cube
 from src.data.pca_reducer import SpectralPCAReducer
 from src.models.benchmark import compare_architectures
+from src.models.checkpoint import load_model_checkpoint
 from src.models.cnn3d import SpectralSpatial3DCNN
 from src.models.hybrid import HybridSpectralSpatialViT
 
@@ -63,6 +64,49 @@ def get_model(model_type: str) -> nn.Module:
             f"Unsupported model_type '{model_type}'. Available models: {list(_MODEL_REGISTRY.keys())}"
         )
     return _MODEL_REGISTRY[model_type]
+
+
+def get_model_for_inference(
+    model_type: str,
+    pca_components: int,
+    checkpoint_dir: Union[str, Path] = "checkpoints",
+) -> Tuple[nn.Module, bool]:
+    """Retrieve a model for inference, loading trained demo weights if available.
+
+    Checks whether ``<checkpoint_dir>/<model_type>_demo.pt`` exists and
+    ``pca_components == 15``. If so, loads the trained weights via
+    :func:`load_model_checkpoint` and returns ``(model, True)``. Otherwise,
+    instantiates a fresh model in evaluation mode and returns ``(model, False)``.
+    """
+    if model_type not in _MODEL_REGISTRY:
+        raise ValueError(
+            f"Unsupported model_type '{model_type}'. Available models: {list(_MODEL_REGISTRY.keys())}"
+        )
+
+    ckpt_path = Path(checkpoint_dir) / f"{model_type}_demo.pt"
+    if pca_components == 15 and ckpt_path.is_file():
+        loaded_model, _ = load_model_checkpoint(
+            ckpt_path,
+            in_channels=pca_components,
+            device="cpu",
+        )
+        return loaded_model, True
+
+    if model_type == "hybrid":
+        fresh_model: nn.Module = HybridSpectralSpatialViT(
+            in_channels=1,
+            cnn_features=32,
+            vit_embed_dim=64,
+            patch_size=4,
+            num_classes=2,
+        )
+    else:
+        fresh_model = SpectralSpatial3DCNN(
+            in_channels=1,
+            num_classes=2,
+        )
+    fresh_model.eval()
+    return fresh_model, False
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -123,7 +167,11 @@ def generate_forecast(request: ForecastRequest) -> ForecastResponse:
         reduced_raster = reducer.fit_transform(cube)
 
         # 4. Neural inference via overlapping spatial tiling
-        model = get_model(request.model_type)
+        model, _ = get_model_for_inference(
+            model_type=request.model_type,
+            pca_components=request.pca_components,
+            checkpoint_dir=_CHECKPOINT_DIR,
+        )
         tiling_cfg = TilingConfig(patch_size=16, stride=8, batch_size=8, device="cpu")
         prob_map = predict_full_raster(model, reduced_raster, config=tiling_cfg)
 
