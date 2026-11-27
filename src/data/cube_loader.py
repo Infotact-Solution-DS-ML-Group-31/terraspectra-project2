@@ -8,6 +8,8 @@ PRISMA, EnMAP, Sentinel-2).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import io
+from pathlib import Path
 from typing import Any, Dict, Tuple
 import numpy as np
 
@@ -201,4 +203,62 @@ def generate_synthetic_hyperspectral_cube(
     )
 
     return cube, disease_mask
+
+
+def load_cube_from_bytes(raw_bytes: bytes, filename: str) -> HyperspectralCube:
+    """Load a HyperspectralCube from raw .npy or .npz file bytes.
+
+    Args:
+        raw_bytes: Raw file bytes uploaded or read from disk.
+        filename: Original filename used to determine format ('.npy' or '.npz').
+
+    Returns:
+        Validated HyperspectralCube instance.
+
+    Raises:
+        ValueError: If the file extension is unsupported, archive is missing
+            'data', or array rank is not 3D (C, H, W).
+    """
+    ext = Path(filename).suffix.lower()
+    if ext not in {".npy", ".npz"}:
+        raise ValueError(
+            f"Unsupported file extension '{ext}'. Expected '.npy' or '.npz'."
+        )
+
+    buffer = io.BytesIO(raw_bytes)
+    if ext == ".npy":
+        arr = np.load(buffer, allow_pickle=False)
+        if not isinstance(arr, np.ndarray) or arr.ndim != 3:
+            shape = getattr(arr, "shape", None)
+            raise ValueError(
+                f"Expected a 3D array (C, H, W) in .npy file, got shape {shape}."
+            )
+        data = arr.astype(np.float32)
+        wavelengths = np.linspace(400.0, 2500.0, data.shape[0], dtype=np.float32)
+    else:
+        with np.load(buffer, allow_pickle=False) as archive:
+            if "data" not in archive:
+                raise ValueError(
+                    "Invalid .npz archive: missing required 'data' array."
+                )
+            arr = archive["data"]
+            if not isinstance(arr, np.ndarray) or arr.ndim != 3:
+                shape = getattr(arr, "shape", None)
+                raise ValueError(
+                    f"Expected a 3D array (C, H, W) for 'data', got shape {shape}."
+                )
+            data = arr.astype(np.float32)
+            if "wavelengths_nm" in archive:
+                wavelengths = archive["wavelengths_nm"].astype(np.float32)
+            elif "wavelengths" in archive:
+                wavelengths = archive["wavelengths"].astype(np.float32)
+            else:
+                wavelengths = np.linspace(400.0, 2500.0, data.shape[0], dtype=np.float32)
+
+    return HyperspectralCube(
+        data=data,
+        wavelengths=wavelengths,
+        spatial_resolution_meters=3.0,
+        metadata={"source": "uploaded", "filename": filename},
+    )
 

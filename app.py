@@ -24,7 +24,11 @@ from src.analysis.spectral_index import (
     summarize_field_health,
 )
 from src.api.tiling import TilingConfig, predict_full_raster
-from src.data.cube_loader import generate_synthetic_hyperspectral_cube
+from src.data.cube_loader import (
+    HyperspectralCube,
+    generate_synthetic_hyperspectral_cube,
+    load_cube_from_bytes,
+)
 from src.data.pca_reducer import SpectralPCAReducer
 from src.models.benchmark import compare_architectures
 from src.models.cnn3d import SpectralSpatial3DCNN
@@ -57,6 +61,60 @@ def get_cached_model(model_type: str) -> nn.Module:
     return _MODEL_CACHE[model_type]
 
 
+def _run_pipeline_on_cube(
+    cube: HyperspectralCube,
+    model_type: str = "hybrid",
+    threshold: float = 0.5,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """Run biophysical index extraction, PCA, inference, and geospatial analysis on a cube."""
+    # Biophysical spectral indices
+    ndvi_map = compute_ndvi(cube)
+    stress_map = compute_red_edge_stress(cube)
+
+    # Spectral PCA dimensionality reduction (cap components to available bands)
+    n_components = min(15, cube.num_bands)
+    reducer = SpectralPCAReducer(n_components=n_components, random_state=seed)
+    reduced_raster = reducer.fit_transform(cube)
+
+    # Neural inference via overlapping spatial tiling
+    model = get_cached_model(model_type)
+    tiling_cfg = TilingConfig(patch_size=16, stride=8, batch_size=8, device="cpu")
+    prob_map = predict_full_raster(model, reduced_raster, config=tiling_cfg)
+
+    # Temporal epidemic spread simulation across forecast horizons
+    temporal_frames = simulate_temporal_spread(
+        base_prob_map=prob_map,
+        days=[0, 3, 7, 14],
+        growth_rate=0.06,
+    )
+
+    # Field health summarization for base detection
+    health_summary = summarize_field_health(
+        prob_map=prob_map,
+        ndvi_map=ndvi_map,
+        threshold=threshold,
+        pixel_area_sq_m=1.0,
+    )
+
+    # Convert to georeferenced 3D grid records
+    geogrid_records = raster_to_geogrid(
+        prob_map=prob_map,
+        ndvi_map=ndvi_map,
+        stress_map=stress_map,
+        threshold=threshold,
+    )
+
+    return {
+        "prob_map": prob_map,
+        "ndvi_map": ndvi_map,
+        "stress_map": stress_map,
+        "temporal_frames": temporal_frames,
+        "health_summary": health_summary,
+        "geogrid_records": geogrid_records,
+    }
+
+
 def run_dashboard_pipeline(
     model_type: str = "hybrid",
     size: int = 32,
@@ -83,7 +141,6 @@ def run_dashboard_pipeline(
             - 'health_summary': Diagnostic dictionary from summarize_field_health
             - 'geogrid_records': List of georeferenced pixel records for PyDeck
     """
-    # 1. Simulate 224-band continuous hyperspectral datacube (400-2500nm)
     cube, _ = generate_synthetic_hyperspectral_cube(
         height=size,
         width=size,
@@ -91,51 +148,12 @@ def run_dashboard_pipeline(
         disease_zone_radius=max(4, size // 8),
         seed=seed,
     )
-
-    # 2. Biophysical spectral indices
-    ndvi_map = compute_ndvi(cube)
-    stress_map = compute_red_edge_stress(cube)
-
-    # 3. Spectral PCA dimensionality reduction (224 bands -> 15 components)
-    reducer = SpectralPCAReducer(n_components=15, random_state=seed)
-    reduced_raster = reducer.fit_transform(cube)
-
-    # 4. Neural inference via overlapping spatial tiling
-    model = get_cached_model(model_type)
-    tiling_cfg = TilingConfig(patch_size=16, stride=8, batch_size=8, device="cpu")
-    prob_map = predict_full_raster(model, reduced_raster, config=tiling_cfg)
-
-    # 5. Temporal epidemic spread simulation across forecast horizons
-    temporal_frames = simulate_temporal_spread(
-        base_prob_map=prob_map,
-        days=[0, 3, 7, 14],
-        growth_rate=0.06,
-    )
-
-    # 6. Field health summarization for base detection
-    health_summary = summarize_field_health(
-        prob_map=prob_map,
-        ndvi_map=ndvi_map,
+    return _run_pipeline_on_cube(
+        cube=cube,
+        model_type=model_type,
         threshold=threshold,
-        pixel_area_sq_m=1.0,
+        seed=seed,
     )
-
-    # 7. Convert to georeferenced 3D grid records
-    geogrid_records = raster_to_geogrid(
-        prob_map=prob_map,
-        ndvi_map=ndvi_map,
-        stress_map=stress_map,
-        threshold=threshold,
-    )
-
-    return {
-        "prob_map": prob_map,
-        "ndvi_map": ndvi_map,
-        "stress_map": stress_map,
-        "temporal_frames": temporal_frames,
-        "health_summary": health_summary,
-        "geogrid_records": geogrid_records,
-    }
 
 
 def _call_fastapi_backend(
@@ -208,6 +226,21 @@ def main() -> None:
     with st.sidebar:
         st.header("⚙️ Simulation & Model Controls")
 
+        data_source = st.radio(
+            "Data Source",
+            options=["Synthetic Farm Cube", "Upload .npy / .npz Cube"],
+            index=0,
+            help="Choose between synthetic Hyperion simulation or your own 3D hyperspectral datacube.",
+        )
+
+        uploaded_file = None
+        if data_source == "Upload .npy / .npz Cube":
+            uploaded_file = st.file_uploader(
+                "Upload Hyperspectral Cube (.npy / .npz)",
+                type=["npy", "npz"],
+                help="3D array (C, H, W) in .npy format or .npz with 'data' (and optional 'wavelengths_nm').",
+            )
+
         model_type = st.selectbox(
             "Neural Architecture",
             options=["hybrid", "cnn3d"],
@@ -270,72 +303,93 @@ def main() -> None:
     # ==========================
     # Execute Pipeline
     # ==========================
-    with st.spinner("Processing Hyperspectral Datacube & Running 3D-ViT Inference..."):
-        api_response: Optional[Dict[str, Any]] = None
+    if data_source == "Upload .npy / .npz Cube":
+        if uploaded_file is None:
+            st.info("👆 Upload a `.npy` or `.npz` hyperspectral cube in the sidebar to run 3D GIS forecasting.")
+            return
+        try:
+            uploaded_cube = load_cube_from_bytes(
+                raw_bytes=uploaded_file.getvalue(),
+                filename=uploaded_file.name,
+            )
+        except ValueError as exc:
+            st.error(f"❌ Invalid uploaded datacube: {exc}")
+            return
 
-        if use_fastapi:
-            api_response = _call_fastapi_backend(
-                api_url=api_url,
+        with st.spinner(f"Processing uploaded cube '{uploaded_file.name}' ({uploaded_cube.shape})..."):
+            results = _run_pipeline_on_cube(
+                cube=uploaded_cube,
                 model_type=model_type,
-                size=size,
                 threshold=threshold,
                 seed=int(seed),
             )
-            if api_response is None:
-                st.warning(
-                    "⚠️ **FastAPI backend unreachable** — falling back to the local "
-                    "Python pipeline.  Start the server with:\n\n"
-                    "```\n.venv\\Scripts\\uvicorn.exe src.api.main:app --reload --port 8000\n```"
+    else:
+        with st.spinner("Processing Hyperspectral Datacube & Running 3D-ViT Inference..."):
+            api_response: Optional[Dict[str, Any]] = None
+
+            if use_fastapi:
+                api_response = _call_fastapi_backend(
+                    api_url=api_url,
+                    model_type=model_type,
+                    size=size,
+                    threshold=threshold,
+                    seed=int(seed),
                 )
+                if api_response is None:
+                    st.warning(
+                        "⚠️ **FastAPI backend unreachable** — falling back to the local "
+                        "Python pipeline.  Start the server with:\n\n"
+                        "```\n.venv\\Scripts\\uvicorn.exe src.api.main:app --reload --port 8000\n```"
+                    )
 
-        # Use local pipeline if FastAPI is disabled or server was unreachable
-        if api_response is None:
-            results = run_dashboard_pipeline(
-                model_type=model_type,
-                size=size,
-                threshold=threshold,
-                seed=int(seed),
-            )
-        else:
-            # Build a results dict compatible with the rest of the dashboard from
-            # the FastAPI JSON response.  The API returns flat prob / ndvi maps;
-            # we reconstruct numpy arrays and derive temporal frames locally.
-            import numpy as _np  # local to avoid shadowing module-level np
+            # Use local pipeline if FastAPI is disabled or server was unreachable
+            if api_response is None:
+                results = run_dashboard_pipeline(
+                    model_type=model_type,
+                    size=size,
+                    threshold=threshold,
+                    seed=int(seed),
+                )
+            else:
+                # Build a results dict compatible with the rest of the dashboard from
+                # the FastAPI JSON response.  The API returns flat prob / ndvi maps;
+                # we reconstruct numpy arrays and derive temporal frames locally.
+                import numpy as _np  # local to avoid shadowing module-level np
 
-            prob_flat = api_response.get("probability_map", [])
-            ndvi_flat = api_response.get("ndvi_map", [])
-            stress_flat = api_response.get("red_edge_stress_map", [])
+                prob_flat = api_response.get("probability_map", [])
+                ndvi_flat = api_response.get("ndvi_map", [])
+                stress_flat = api_response.get("red_edge_stress_map", [])
 
-            prob_map_api = _np.array(prob_flat, dtype=_np.float32)
-            ndvi_map_api = _np.array(ndvi_flat, dtype=_np.float32)
-            stress_map_api = _np.array(stress_flat, dtype=_np.float32)
+                prob_map_api = _np.array(prob_flat, dtype=_np.float32)
+                ndvi_map_api = _np.array(ndvi_flat, dtype=_np.float32)
+                stress_map_api = _np.array(stress_flat, dtype=_np.float32)
 
-            temporal_frames = simulate_temporal_spread(
-                base_prob_map=prob_map_api,
-                days=[0, 3, 7, 14],
-                growth_rate=0.06,
-            )
-            health_summary_api = summarize_field_health(
-                prob_map=prob_map_api,
-                ndvi_map=ndvi_map_api,
-                threshold=threshold,
-                pixel_area_sq_m=1.0,
-            )
-            geogrid_records_api = raster_to_geogrid(
-                prob_map=prob_map_api,
-                ndvi_map=ndvi_map_api,
-                stress_map=stress_map_api,
-                threshold=threshold,
-            )
-            results = {
-                "prob_map": prob_map_api,
-                "ndvi_map": ndvi_map_api,
-                "stress_map": stress_map_api,
-                "temporal_frames": temporal_frames,
-                "health_summary": health_summary_api,
-                "geogrid_records": geogrid_records_api,
-            }
-            st.success("✅ Results fetched from FastAPI backend.")
+                temporal_frames = simulate_temporal_spread(
+                    base_prob_map=prob_map_api,
+                    days=[0, 3, 7, 14],
+                    growth_rate=0.06,
+                )
+                health_summary_api = summarize_field_health(
+                    prob_map=prob_map_api,
+                    ndvi_map=ndvi_map_api,
+                    threshold=threshold,
+                    pixel_area_sq_m=1.0,
+                )
+                geogrid_records_api = raster_to_geogrid(
+                    prob_map=prob_map_api,
+                    ndvi_map=ndvi_map_api,
+                    stress_map=stress_map_api,
+                    threshold=threshold,
+                )
+                results = {
+                    "prob_map": prob_map_api,
+                    "ndvi_map": ndvi_map_api,
+                    "stress_map": stress_map_api,
+                    "temporal_frames": temporal_frames,
+                    "health_summary": health_summary_api,
+                    "geogrid_records": geogrid_records_api,
+                }
+                st.success("✅ Results fetched from FastAPI backend.")
 
     # ==========================
     # Main View Tabs
