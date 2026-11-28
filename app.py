@@ -21,6 +21,7 @@ from src.analysis.geospatial import raster_to_geogrid, simulate_temporal_spread
 from src.analysis.spectral_index import (
     compute_ndvi,
     compute_red_edge_stress,
+    compute_spectral_signatures,
     summarize_field_health,
 )
 from src.api.tiling import TilingConfig, predict_full_raster
@@ -106,6 +107,7 @@ def _run_pipeline_on_cube(
     )
 
     return {
+        "cube": cube,
         "prob_map": prob_map,
         "ndvi_map": ndvi_map,
         "stress_map": stress_map,
@@ -507,6 +509,29 @@ def main() -> None:
         )
 
         st.pydeck_chart(deck, use_container_width=True)
+
+        # ==========================
+        # Spectral Reflectance Signature (400-2500 nm)
+        # ==========================
+        if "cube" in results:
+            st.markdown("---")
+            st.subheader("📈 Spectral Reflectance Signature (400–2500 nm)")
+            st.caption(
+                "Mean canopy reflectance profile comparing Healthy vs. Infected pixels across all spectral bands."
+            )
+            signatures = compute_spectral_signatures(
+                cube=results["cube"],
+                prob_map=current_prob_map,
+                threshold=threshold,
+            )
+            df_spectra = pd.DataFrame(
+                {
+                    "Healthy": signatures["healthy_mean"],
+                    "Infected": signatures["infected_mean"],
+                },
+                index=pd.Index(signatures["wavelengths_nm"], name="Wavelength (nm)"),
+            )
+            st.line_chart(df_spectra)
 
         # ==========================
         # Biophysical Indices & Export

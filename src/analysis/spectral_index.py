@@ -187,3 +187,69 @@ def summarize_field_health(
         "mean_ndvi_infected": mean_ndvi_infected,
         "severity_level": severity_level,
     }
+
+
+def compute_spectral_signatures(
+    cube: HyperspectralCube,
+    prob_map: np.ndarray,
+    threshold: float = 0.5,
+) -> Dict[str, Any]:
+    """Compute mean spectral reflectance signatures for healthy vs. infected canopy pixels.
+
+    Args:
+        cube: HyperspectralCube of shape (C, H, W).
+        prob_map: 2D array of pixel-level disease probabilities of shape (H, W).
+        threshold: Probability cutoff separating healthy (< threshold) and
+            infected (>= threshold) pixels.
+
+    Returns:
+        Dictionary with keys:
+            - 'wavelengths_nm': list[float] of length C
+            - 'healthy_mean': list[float] of length C
+            - 'infected_mean': list[float] of length C
+
+    Raises:
+        TypeError: If cube is not a HyperspectralCube or prob_map is invalid.
+        ValueError: If prob_map is not 2D, shapes mismatch, or threshold is out of [0, 1].
+    """
+    if not isinstance(cube, HyperspectralCube):
+        raise TypeError(f"Expected HyperspectralCube, got {type(cube)}")
+
+    if hasattr(prob_map, "detach"):
+        prob_map = prob_map.detach().cpu().numpy()
+
+    if not isinstance(prob_map, np.ndarray):
+        raise TypeError("prob_map must be a numpy ndarray or torch Tensor.")
+
+    if prob_map.ndim != 2:
+        raise ValueError(f"prob_map must be a 2D array, got {prob_map.ndim}D")
+
+    expected_shape = (cube.height, cube.width)
+    if prob_map.shape != expected_shape:
+        raise ValueError(
+            f"Shape mismatch: cube spatial shape {expected_shape} != prob_map shape {prob_map.shape}"
+        )
+
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError(f"threshold must be in range [0.0, 1.0], got {threshold}")
+
+    wavelengths = _get_cube_wavelengths(cube)
+    infected_mask = prob_map >= threshold
+    healthy_mask = ~infected_mask
+    num_bands = cube.num_bands
+
+    if np.any(healthy_mask):
+        healthy_mean = [float(v) for v in np.mean(cube.data[:, healthy_mask], axis=1)]
+    else:
+        healthy_mean = [0.0] * num_bands
+
+    if np.any(infected_mask):
+        infected_mean = [float(v) for v in np.mean(cube.data[:, infected_mask], axis=1)]
+    else:
+        infected_mean = [0.0] * num_bands
+
+    return {
+        "wavelengths_nm": [float(w) for w in wavelengths],
+        "healthy_mean": healthy_mean,
+        "infected_mean": infected_mean,
+    }
